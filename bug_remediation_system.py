@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from typing import Literal
 import sys
+import os
 
 from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
 from autogen_agentchat.teams import RoundRobinGroupChat, SelectorGroupChat
@@ -11,6 +12,7 @@ from autogen_agentchat.ui import Console
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 from autogen_agentchat.messages import StructuredMessage, BaseChatMessage, StopMessage
 from autogen_agentchat.base import TerminationCondition
+from autogen_ext.tools.mcp import StdioServerParams, mcp_server_tools
 
 load_dotenv()
 
@@ -66,6 +68,8 @@ def custom_selector(messages):
 
     # Fixed sequence for first 4 turns
     if last_speaker == "user":
+        return "fetcher_agent"
+    if last_speaker == "fetcher_agent":
         return "triage_agent"
     if last_speaker == "triage_agent":
         return "investigation_agent"
@@ -99,12 +103,32 @@ def get_human_input(prompt: str) -> str:
 async def main():
     model_client = OpenAIChatCompletionClient(model="gpt-4o-mini")
 
-    # Agent 1: Triage (same as before)
+    jira_server_params = StdioServerParams(
+        command="mcp-atlassian",
+        args=[],
+        env={
+            "JIRA_URL": os.environ["JIRA_URL"],
+            "JIRA_USERNAME": os.environ["JIRA_USERNAME"],
+            "JIRA_API_TOKEN": os.environ["JIRA_API_TOKEN"],
+        },
+    )
+    jira_tools = await mcp_server_tools(jira_server_params)
+
+    # Agent 1: Fetch ticket details from JIRA
+    fetcher_agent = AssistantAgent(
+    name="fetcher_agent",
+    model_client=model_client,
+    system_message="""Use the jira_get_issue tool to fetch the requested Jira issue.
+    Report back the issue's key, summary, and full description as plain text.""",
+    tools=jira_tools,
+)
+
+    # Agent 2: Triage (same as before)
     triage_agent = AssistantAgent(
         name="triage_agent",
         model_client=model_client,
         system_message="""You are a Triage Agent for a software bug remediation system.
-        Analyze the bug report and classify it according to the required schema.""",
+        Analyze the provided bug report and classify it according to the required schema.""",
         output_content_type=TriageResult,
     )
 
@@ -126,9 +150,8 @@ async def main():
         system_message="""You are a Fix Generator Agent for a software bug remediation system.
         You receive a bug triage classification and an investigation analysis.
         Your job: propose a concrete code fix and a unit test for it.
-        Write the fix as a realistic C# code snippet appropriate for a .NET codebase.
-        Be specific and production-quality. Assess the risk level of your proposed change honestly.
-        End your message with the word TERMINATE.""",
+        Write the fix as a realistic C#/Type script code snippet appropriate for a .NET/ReactJS codebase.
+        Be specific and production-quality. Assess the risk level of your proposed change honestly.""",
         output_content_type=FixProposal,
     )
 
@@ -183,7 +206,7 @@ async def main():
 
     # The TEAM: defines turn order + when to stop
     team = SelectorGroupChat(
-        participants=[triage_agent, investigation_agent, fix_agent, human_review_1, pr_agent, human_review_2],
+        participants=[fetcher_agent, triage_agent, investigation_agent, fix_agent, human_review_1, pr_agent, human_review_2],
         model_client=model_client, # <- model_client NOT REQUIRED FOR "RoundRobinGroupChat"
         #selector_prompt=selector_prompt,
         selector_func=custom_selector,
@@ -191,14 +214,10 @@ async def main():
         custom_message_types=[StructuredMessage[TriageResult], StructuredMessage[FixProposal], StructuredMessage[PRResult]]
     )
 
-    bug_report = """
-    BUG-1042: NullReferenceException in PaymentService.ProcessRefund()
-    Production error. Stack trace shows orderId exists but refund record is null.
-    Affects ~12% of refund attempts since deploy v2.4.1.
-    """
+    bug_report = "Fetch and triage Jira issue ABR-1"
 
     print("\n" + "="*60)
-    print("Starting Bug Remediation Pipeline for BUG-1042")
+    print("Starting Bug Remediation Pipeline for ABR-1")
     print("="*60 + "\n")
 
     # Console() streams each agent's message live as it happens
@@ -216,11 +235,11 @@ async def main():
 
     if final_decision and "approve" in final_decision:
         print("\n" + "="*60)
-        print("✅ MERGED TO QA — Bug remediation complete!")
+        print("MERGED TO QA — Bug remediation complete!")
         print("="*60)
     else:
         print("\n" + "="*60)
-        print("❌ NOT MERGED — Pipeline stopped before completion.")
+        print("NOT MERGED — Pipeline stopped before completion.")
         print("="*60)
 
     await model_client.close()
