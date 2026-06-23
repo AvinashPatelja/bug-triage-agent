@@ -169,11 +169,20 @@ async def run_pipeline_job(job_id: str, issue_key: str):
             "JIRA_API_TOKEN": os.environ["JIRA_API_TOKEN"],
         },
     )
-    jira_tools = await mcp_server_tools(jira_server_params)
-    transition_only_tools = [
-        tool for tool in jira_tools
-        if tool.name in ("jira_get_transitions", "jira_transition_issue")
-    ]
+    jira_tools = None
+    for attempt in range(3):
+        try:
+            jira_tools = await mcp_server_tools(jira_server_params)
+            print(f"[DEBUG] Got {len(jira_tools)} jira tools (attempt {attempt + 1})")
+            break
+        except Exception as e:
+            print(f"[DEBUG] Attempt {attempt + 1} failed: {type(e).__name__}: {e}")
+            await asyncio.sleep(1)
+    
+    if jira_tools is None:
+        job["status"] = "failed"
+        return
+        
     model_client = OpenAIChatCompletionClient(model="gpt-4o-mini")
 
     fetcher_agent = AssistantAgent(
@@ -195,21 +204,33 @@ async def run_pipeline_job(job_id: str, issue_key: str):
         model_client=model_client,
         system_message="""Call jira_add_comment right now to post the given triage summary
         as a comment on the given Jira issue key. Do this immediately, take no other action.""",
-        tools=transition_only_tools,
+        tools=jira_tools,
     )
 
+    # jira_transitioner_agent = AssistantAgent(
+    #     name="jira_transitioner_agent",
+    #     model_client=model_client,
+    #     system_message="""You move a Jira issue to "In Progress". You will be told the issue key.
+
+    #     Step 1: Call jira_get_transitions with that issue key.
+    #     Step 2: From the result, find the entry whose "name" is exactly "In Progress" and note its "id".
+    #     Step 3: Call jira_transition_issue with that issue key and transition_id set to that id (as a string).
+
+    #     Do NOT call jira_add_comment. Do NOT call any other tool. Your only job is the transition,
+    #     nothing else. You must complete Step 3 - calling jira_get_transitions alone is not enough.""",
+    #     tools=transition_only_tools,
+    # )
     jira_transitioner_agent = AssistantAgent(
         name="jira_transitioner_agent",
         model_client=model_client,
-        system_message="""You move a Jira issue to "In Progress". You will be told the issue key.
+        system_message="""You move a Jira issue to In Progress.
 
-        Step 1: Call jira_get_transitions with that issue key.
-        Step 2: From the result, find the entry whose "name" is exactly "In Progress" and note its "id".
-        Step 3: Call jira_transition_issue with that issue key and transition_id set to that id (as a string).
+        Step 1: Call jira_get_transitions for the issue key.
+        Step 2: Find the transition whose name is exactly "In Progress".
+        Step 3: Call jira_transition_issue with that same issue key and the matching transition id.
 
-        Do NOT call jira_add_comment. Do NOT call any other tool. Your only job is the transition,
-        nothing else. You must complete Step 3 - calling jira_get_transitions alone is not enough.""",
-        tools=transition_only_tools,
+        Do not stop after listing transitions. Your job is not done until the issue is transitioned successfully.""",
+        tools=[t for t in jira_tools if t.name in ("jira_get_transitions", "jira_transition_issue")],
     )
 
     investigation_agent = AssistantAgent(
@@ -265,7 +286,7 @@ async def run_pipeline_job(job_id: str, issue_key: str):
         participants=[
             fetcher_agent, triage_agent, investigation_agent, code_reader_agent,
             fix_agent, human_review_1, pr_agent, human_review_2, jira_commenter_agent,
-            jira_transitioner_agent,
+            jira_transitioner_agent
         ],
         model_client=model_client,
         selector_func=custom_selector,
@@ -283,7 +304,7 @@ async def run_pipeline_job(job_id: str, issue_key: str):
 
     final_outcome = "completed"  # default
 
-    async for message in team.run_stream(task=f"Fetch and triage Jira issue {issue_key}"):
+    async for message in team.run_stream(task=f"Fetch and triage Jira issue {issue_key}. After posting the triage comment, transition this issue to In Progress. Issue key: {issue_key}"):
         source = getattr(message, "source", None)
         if source is None:
             continue
