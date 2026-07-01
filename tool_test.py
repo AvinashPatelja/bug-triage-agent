@@ -28,7 +28,7 @@ async def main():
         tools=[get_bug_priority_policy],
     )
 
-    response = await agent.run(task="A Critical severity bug just came in. What's our SLA for it?")
+    response = await agent.run(task="A Low severity bug just came in. What's our SLA for it?")
     print(response.messages[-1].content)
 
     await client.close()
